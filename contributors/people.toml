@@ -157,3 +157,7 @@ sync_github_name = false
 
 [people.firaslamouchi21]
 real_name = "Firas Lamouchi"
+
+[people.yeniufuklar-com]
+real_name = "Ufuk Efe"
+sync_github_name = true

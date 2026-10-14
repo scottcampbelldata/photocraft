@@ -1206,8 +1206,8 @@ pub fn is_enabled(app: &PhotocraftApp, id: &str) -> Option<bool> {
         i if i.starts_with("edit.transform.") && t.content_aware.is_some() => Some(false),
         "edit.undo" => Some(steps.is_some_and(|s| s.can_undo(&Step::of(t)))),
         "edit.redo" => Some(steps.is_some_and(|s| !s.redo.is_empty())),
-        // No Toggle Last State under the box, and one box at a time.
-        "edit.toggleLastState" | "edit.contentAwareScale" | "edit.puppetWarp" => Some(false),
+        // No Toggle Last State or history jump under the box, and one box at a time.
+        "edit.toggleLastState" | "history.selectState" | "edit.contentAwareScale" | "edit.puppetWarp" => Some(false),
         // Rotate and Flip turn the box (not while warping, where the mesh is the box).
         _ if box_preset(id).is_some() => Some(t.warp.is_none()),
         // Editable type can't be distorted (#2630, as #2701 rules for the menus outside a box).
@@ -1240,9 +1240,10 @@ fn box_preset(id: &str) -> Option<(f64, f64, f64)> {
 }
 
 /// While transforming, the box owns the history for every caller (menus, shortcuts, the control
-/// channel, MCP): Undo and Redo step through it, and Toggle Last State, which would change the
-/// document under the box, is refused. Edit › Transform's Rotate and Flip turn the box itself, as
-/// in Photoshop, instead of the layer under it; committing stays with ↩ and the options bar.
+/// channel, MCP): Undo and Redo step through it, and Toggle Last State and History state jumps,
+/// which would change the document under the box, are refused. Edit › Transform's Rotate and
+/// Flip turn the box itself, as in Photoshop, instead of the layer under it; committing stays
+/// with ↩ and the options bar.
 /// `None` for other commands or when not transforming.
 /// The commands the open box answers itself ([`is_enabled`], [`intercept`]).
 fn box_command(id: &str) -> bool {
@@ -1257,7 +1258,9 @@ pub fn intercept(app: &mut PhotocraftApp, id: &str) -> Option<Result<serde_json:
     match id {
         "edit.undo" => Some(Ok(step(app, false))),
         "edit.redo" => Some(Ok(step(app, true))),
-        "edit.toggleLastState" | "edit.contentAwareScale" | "edit.puppetWarp" => Some(Err("Commit or cancel the transform first".into())),
+        "edit.toggleLastState" | "history.selectState" | "edit.contentAwareScale" | "edit.puppetWarp" => {
+            Some(Err("Commit or cancel the transform first".into()))
+        }
         _ => {
             let (kx, ky, angle) = box_preset(id)?;
             if warping {
@@ -1677,20 +1680,25 @@ pub(crate) fn apply_drag(s: &mut TransformSession, g: Gesture, p: [f64; 2], mods
             let anchor = |side: Option<f64>, pivot: f64| if mods.alt { pivot } else { side.map_or(0.5, |s| 1.0 - s) };
             let (au, av) = (anchor(du, pu), anchor(dv, pv));
             // The factor that takes the dragged side to the pointer. A reference point on that
-            // side leaves no such factor, so that axis keeps its size.
+            // side leaves no such factor; proportional scaling takes the other axis's factor.
             let factor = |side: Option<f64>, to: f64, anchor: f64| {
-                side.map_or(1.0, |side| {
+                side.map_or(Some(1.0), |side| {
                     let f = (to - anchor) / (side - anchor);
-                    if (side - anchor).abs() > 1e-9 && f.is_finite() { f } else { 1.0 }
+                    ((side - anchor).abs() > 1e-9 && f.is_finite()).then_some(f)
                 })
             };
-            let (mut fu, mut fv) = (factor(du, u, au), factor(dv, v, av));
+            let (gu, gv) = (factor(du, u, au), factor(dv, v, av));
+            let (mut fu, mut fv) = (gu.unwrap_or(1.0), gv.unwrap_or(1.0));
             // Corners and edges scale proportionally by default; ⇧ frees them (the legacy
             // preference swaps the two for corners and always stretches edges, `legacy_mods`).
             if !mods.shift {
                 if matches!(g.hit, Hit::Corner(_)) {
-                    // The larger factor wins; each axis keeps its own flip.
-                    let k = fu.abs().max(fv.abs());
+                    // An undefined factor must not prevent the other axis from shrinking.
+                    let k = match (gu, gv) {
+                        (Some(a), Some(b)) => a.abs().max(b.abs()),
+                        (Some(a), None) | (None, Some(a)) => a.abs(),
+                        (None, None) => 1.0,
+                    };
                     (fu, fv) = (k.copysign(fu), k.copysign(fv));
                 } else if du.is_some() {
                     // An edge sets the scale of its own axis and the other axis follows by the same
@@ -1995,6 +2003,15 @@ pub fn cursor(app: &PhotocraftApp, p: [f64; 2], quick_split: bool) -> Option<Cur
     })
 }
 
+/// For each vertex of the preview's `n` × `n` grid over the unit square (row by row), whether it
+/// maps to the front side of `h`'s horizon. A Distort dragged past the horizon sends the rest of
+/// the image to the far side, where its cells would wrap round infinity; the preview leaves them
+/// out, as the committed warp does (#4863).
+fn front_vertices(h: &Homography, n: usize) -> Vec<bool> {
+    let front = h.front_side([0.0, 0.0, 1.0, 1.0]);
+    (0..=n).flat_map(|j| (0..=n).map(move |i| (i as f64 / n as f64, j as f64 / n as f64))).map(|(u, v)| front * h.w(u, v) > 1e-9).collect()
+}
+
 /// Warped preview of the moving pixels plus the box, handles and reference point.
 pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
     let (Some(t), Some(pv)) = (&app.ui.transform, &app.transform_preview) else { return };
@@ -2031,6 +2048,7 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
         };
         let mut mesh = egui::Mesh::with_texture(tex);
         let tint = Color32::from_white_alpha((pv.opacity.clamp(0.0, 1.0) * 255.0) as u8);
+        let ahead = front_vertices(&h, n);
         for j in 0..=n {
             for i in 0..=n {
                 let (u, v) = (i as f64 / n as f64, j as f64 / n as f64);
@@ -2041,8 +2059,12 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
         for j in 0..n {
             for i in 0..n {
                 let a = (j * (n + 1) + i) as u32;
-                mesh.add_triangle(a, a + 1, a + n as u32 + 2);
-                mesh.add_triangle(a, a + n as u32 + 2, a + n as u32 + 1);
+                for tri in [[a, a + 1, a + n as u32 + 2], [a, a + n as u32 + 2, a + n as u32 + 1]] {
+                    // A cell with a corner past the horizon would stretch across the canvas (#4863).
+                    if tri.iter().all(|&k| ahead[k as usize]) {
+                        mesh.add_triangle(tri[0], tri[1], tri[2]);
+                    }
+                }
             }
         }
         painter.add(clip_to_canvas(mesh, canvas_size(pv), |p| xf.to_screen(p.x, p.y)));
@@ -3599,6 +3621,30 @@ mod tests {
         assert_eq!(t.pivot, [40.0, 40.0]);
     }
 
+    #[test]
+    fn alt_corner_shrinks_when_reference_point_is_on_a_dragged_axis() {
+        for (pivot, from, to, bounds) in [
+            ([100.0, 25.0], [100.0, 0.0], [100.0, 12.5], [50.0, 12.5, 100.0, 37.5]),
+            ([0.0, 25.0], [0.0, 0.0], [0.0, 12.5], [0.0, 12.5, 50.0, 37.5]),
+            ([50.0, 0.0], [100.0, 0.0], [75.0, 0.0], [25.0, 0.0, 75.0, 25.0]),
+            ([50.0, 50.0], [100.0, 50.0], [75.0, 50.0], [25.0, 25.0, 75.0, 50.0]),
+            ([100.0, 25.0], [100.0, 0.0], [100.0, 37.5], [50.0, 37.5, 100.0, 12.5]),
+        ] {
+            let mut s = session();
+            s.pivot = pivot;
+            drag(&mut s, from, to, egui::Modifiers::ALT);
+            assert!(close(s.quad, corners(bounds)), "pivot {pivot:?}: {:?}", s.quad);
+            assert!(near(s.pivot, pivot));
+            assert!(s.quad.iter().flatten().all(|value| value.is_finite()));
+        }
+        let mut s = session();
+        s.pivot = [100.0, 0.0];
+        let gesture = Gesture { hit: Hit::Corner(1), start: s.pivot, quad0: s.quad, pivot0: s.pivot };
+        apply_drag(&mut s, gesture, [100.0, 12.5], egui::Modifiers::ALT);
+        assert!(close(s.quad, corners([0.0, 0.0, 100.0, 50.0])));
+        assert!(near(s.pivot, [100.0, 0.0]));
+    }
+
     fn near(a: [f64; 2], b: [f64; 2]) -> bool {
         (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6
     }
@@ -4067,6 +4113,20 @@ mod tests {
 
     /// #1767: just outside a corner is the rotate zone: the OS pointer hides for the drawn curved
     /// arrow, which bends round that corner.
+    #[test]
+    fn the_preview_leaves_out_cells_past_the_horizon() {
+        // #4863: the bottom corners pulled in and one dragged far out: a concave quad whose
+        // source straddles the horizon. Its cells there are left out; an ordinary quad keeps all.
+        let past = Homography::rect_to_quad([0.0, 0.0, 1.0, 1.0], [[0.0, 0.0], [300.0, 0.0], [60.0, 60.0], [0.0, 300.0]]).unwrap();
+        let ahead = front_vertices(&past, 24);
+        assert!(ahead.iter().any(|a| *a) && ahead.iter().any(|a| !*a), "some of the grid is past the horizon");
+        // Three corners are on one side (drawn); the top-left one is past the horizon.
+        assert!(ahead[24 * 25 + 24] && ahead[24] && ahead[24 * 25], "the three corners in front are drawn");
+        assert!(!ahead[0], "the corner past the horizon is left out");
+        let plain = Homography::rect_to_quad([0.0, 0.0, 1.0, 1.0], [[0.0, 0.0], [300.0, 0.0], [280.0, 260.0], [0.0, 300.0]]).unwrap();
+        assert!(front_vertices(&plain, 24).iter().all(|a| *a));
+    }
+
     #[test]
     fn hovering_just_outside_a_corner_asks_for_the_rotate_cursor() {
         let mut app = app_with_square(256, photocraft_geom::Rect::new(32, 32, 160, 160));
